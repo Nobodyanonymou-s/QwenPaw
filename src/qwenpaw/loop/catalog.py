@@ -33,6 +33,25 @@ class DoomLoopParams(_Params):
 
     window_size: int = Field(default=3, ge=2, le=20)
     similarity_threshold: float = Field(default=1.0, ge=0.0, le=1.0)
+    fuzzy_streak_warn: int = Field(
+        default=5,
+        ge=2,
+        le=50,
+        description=(
+            "Warn after this many consecutive same-tool calls whose args "
+            "differ only in numeric values (masked fingerprint)"
+        ),
+    )
+    fuzzy_streak_stop: int = Field(
+        default=8,
+        ge=3,
+        le=100,
+        description=(
+            "Terminate the run after this many consecutive masked-fingerprint "
+            "repeats; raise it for workloads that legitimately page through "
+            "one large file in many chunks"
+        ),
+    )
     stages: list[DoomLoopStageConfig] = Field(
         default_factory=lambda: DoomLoopConfig().stages,
     )
