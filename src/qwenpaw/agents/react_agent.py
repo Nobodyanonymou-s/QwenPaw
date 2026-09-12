@@ -56,6 +56,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Providers state their real context limit in overflow rejections, e.g.
+# "This model's maximum context length is 8192 tokens.".
+_CONTEXT_LIMIT_RE = re.compile(
+    r"maximum context length is (\d+)|context length is (\d+) tokens",
+)
+
 
 _GLOBAL_MEDIA_CAPABILITY_PATTERNS = (
     re.compile(r"\bmodel\s+is\s+text[- ]only\b", re.IGNORECASE),
@@ -712,6 +718,7 @@ class QwenPawAgent(CodingModeMixin, Agent):
                 "Model input exceeded the provider context limit; attempting "
                 "one context recovery.",
             )
+            await self._persist_reported_context_limit(exc)
             input_changed = (
                 await context_manager.recover_from_context_overflow(self)
             )
@@ -740,6 +747,45 @@ class QwenPawAgent(CodingModeMixin, Agent):
                 messages=refreshed_messages,
                 tools=refreshed_tools,
                 tool_choice=tool_choice,
+            )
+
+    async def _persist_reported_context_limit(self, exc: Exception) -> None:
+        """Persist the provider-reported context limit from an overflow 400.
+
+        Compaction re-resolves the stored window on its hot path, so
+        correcting the stored limit here lets the recovery below (and every
+        later turn) compact against the provider's real limit instead of a
+        stale, larger belief. Best-effort: failures only log.
+        """
+        match = _CONTEXT_LIMIT_RE.search(str(exc))
+        if not match:
+            return
+        limit = int(match.group(1) or match.group(2))
+        model_slot = getattr(self._agent_config, "active_model", None)
+        provider_id = getattr(model_slot, "provider_id", "") or ""
+        model_id = getattr(model_slot, "model", "") or ""
+        if not provider_id or not model_id:
+            return
+        try:
+            from ..providers.provider_manager import ProviderManager
+
+            await ProviderManager.get_instance().update_model_config(
+                provider_id=provider_id,
+                model_id=model_id,
+                config={"max_input_length": limit},
+            )
+            logger.info(
+                "Stored context window for %s/%s corrected to %d tokens "
+                "from the provider rejection.",
+                provider_id,
+                model_id,
+                limit,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Could not persist provider-reported context limit %d",
+                limit,
+                exc_info=True,
             )
 
     def _index_tool_schemas(self, tools: list[dict] | None) -> None:
