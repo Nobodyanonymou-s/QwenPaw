@@ -7,6 +7,7 @@ including lazy loading, lifecycle management, and hot reloading.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Callable, Dict, Set
 
@@ -30,7 +31,11 @@ from ..utils.startup_display import AgentStartupDisplay
 logger = logging.getLogger(__name__)
 
 _OLD_WORKSPACE_TASK_WAIT_SECONDS = 60.0
-_OLD_WORKSPACE_TASK_MAX_WAIT_ROUNDS = 24 * 60
+# How many wait rounds delayed cleanup polls before force-reclaiming an old
+# workspace. Overridable for tests and tight-memory deployments.
+_OLD_WORKSPACE_TASK_MAX_WAIT_ROUNDS = int(
+    os.environ.get("QWENPAW_OLD_WORKSPACE_WAIT_ROUNDS", 24 * 60),
+)
 
 
 class MultiAgentManager:
@@ -423,10 +428,14 @@ class MultiAgentManager:
                         )
                     else:
                         logger.error(
-                            f"Tasks did not finish within 24 hours for old "
-                            f"instance {agent_id}. Forcing cleanup to prevent "
-                            f"a resource leak.",
+                            f"Tasks did not finish within the wait budget "
+                            f"for old instance {agent_id}. Cancelling stuck "
+                            f"tasks and forcing cleanup to prevent a "
+                            f"resource leak.",
                         )
+                        for task in active_tasks.values():
+                            if not task.done():
+                                task.cancel()
                     await old_instance.stop(final=False)
                     logger.info(
                         f"Old workspace instance stopped: {agent_id}. "
