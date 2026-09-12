@@ -48,4 +48,18 @@ warn_if_auth_off_container_bind
 envsubst '${QWENPAW_PORT}' \
   < /etc/supervisor/conf.d/supervisord.conf.template \
   > /etc/supervisor/conf.d/supervisord.conf
+
+# WebUI deployments don't need the Xfce desktop stack (the browser tool runs
+# headless in containers); skipping it saves ~150-300MB of resident memory.
+# Set QWENPAW_WITH_DESKTOP=0 to skip. Default keeps the desktop for
+# agent-OS style usage.
+if [ "${QWENPAW_WITH_DESKTOP:-1}" = "0" ]; then
+  echo "ℹ️  QWENPAW_WITH_DESKTOP=0: skipping xvfb/xfce4/dbus (headless webUI mode)."
+  awk '/^\[program:(xvfb|xfce4|dbus)\]/{skip=1; next} /^\[/{skip=0} !skip' \
+    /etc/supervisor/conf.d/supervisord.conf \
+    > /etc/supervisor/conf.d/supervisord.conf.tmp \
+    && mv /etc/supervisor/conf.d/supervisord.conf.tmp \
+       /etc/supervisor/conf.d/supervisord.conf
+fi
+
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
