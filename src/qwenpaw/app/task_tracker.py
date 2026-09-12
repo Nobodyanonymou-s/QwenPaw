@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import weakref
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import (
@@ -26,6 +27,24 @@ logger = logging.getLogger(__name__)
 
 _SENTINEL = None
 
+# Replay buffer and subscriber queues are bounded so a long-lived run cannot
+# accumulate unbounded memory. Reconnects replay at most the most recent
+# events; a full subscriber queue drops the oldest event (live semantics).
+_MAX_REPLAY_EVENTS = 2000
+_SUBSCRIBER_QUEUE_MAXSIZE = 1000
+
+
+def _offer(queue: "asyncio.Queue", item: Any) -> None:
+    """Put without blocking; drop the oldest item when the queue is full."""
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        queue.put_nowait(item)
+
 # Emitted to reconnect subscribers right after the buffered events, so
 # the client can render the replayed part instantly (no token-by-token
 # re-animation) and switch to live streaming afterwards.
@@ -38,7 +57,9 @@ class _RunState:
 
     task: asyncio.Future
     queues: list[asyncio.Queue] = field(default_factory=list)
-    buffer: list[str] = field(default_factory=list)
+    buffer: deque = field(
+        default_factory=lambda: deque(maxlen=_MAX_REPLAY_EVENTS),
+    )
     start_time: Optional[datetime] = None
     finish_time: Optional[datetime] = None
     owner: object | None = None
@@ -195,10 +216,10 @@ class TaskTracker:
             state = self._runs.get(run_key)
             if state is None or state.task.done():
                 return None
-            q: asyncio.Queue = asyncio.Queue()
+            q: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
             for sse in state.buffer:
-                q.put_nowait(sse)
-            q.put_nowait(REPLAY_END_SSE)
+                _offer(q, sse)
+            _offer(q, REPLAY_END_SSE)
             state.queues.append(q)
             return q
 
@@ -265,13 +286,17 @@ class TaskTracker:
         async with self._lock:
             state = self._runs.get(run_key)
             if state is not None and not state.task.done():
-                q: asyncio.Queue = asyncio.Queue()
+                q: asyncio.Queue = asyncio.Queue(
+                    maxsize=_SUBSCRIBER_QUEUE_MAXSIZE,
+                )
                 for sse in state.buffer:
-                    q.put_nowait(sse)
+                    _offer(q, sse)
                 state.queues.append(q)
                 return q, False
 
-            my_queue: asyncio.Queue = asyncio.Queue()
+            my_queue: asyncio.Queue = asyncio.Queue(
+                maxsize=_SUBSCRIBER_QUEUE_MAXSIZE,
+            )
             run = _RunState(
                 task=asyncio.Future(),  # placeholder, replaced below
                 queues=[my_queue],
@@ -300,7 +325,7 @@ class TaskTracker:
                         async with tracker.lock:
                             run.buffer.append(sse)
                             for q in run.queues:
-                                q.put_nowait(sse)
+                                _offer(q, sse)
                 except asyncio.CancelledError:
                     logger.debug("run cancelled run_key=%s", run_key)
                 except Exception:
@@ -314,7 +339,7 @@ class TaskTracker:
                         async with tracker.lock:
                             run.buffer.append(err_sse)
                             for q in run.queues:
-                                q.put_nowait(err_sse)
+                                _offer(q, err_sse)
                 finally:
                     finish_time = datetime.now(timezone.utc)
                     if on_finished is not None:
@@ -332,7 +357,7 @@ class TaskTracker:
                             # pylint: disable=protected-access
                             tracker._global_last_finish_at = finish_time
                             for q in run.queues:
-                                q.put_nowait(_SENTINEL)
+                                _offer(q, _SENTINEL)
                             # pylint: disable=protected-access
                             tracker._runs.pop(
                                 run_key,
