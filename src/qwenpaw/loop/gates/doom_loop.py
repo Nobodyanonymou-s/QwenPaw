@@ -21,6 +21,8 @@ from .loop_gate import LoopGate
 
 logger = logging.getLogger(__name__)
 
+_ARGS_TEXT_LIMIT = 256
+
 
 @dataclass
 class _ToolCallRecord:
@@ -28,6 +30,7 @@ class _ToolCallRecord:
 
     tool_name: str
     args_hash: str
+    fingerprint: str = ""
 
 
 @dataclass
@@ -64,11 +67,15 @@ class DoomLoopGate(LoopGate):
         *,
         window_size: int = 3,
         similarity_threshold: float = 1.0,
+        fuzzy_streak_warn: int = 5,
+        fuzzy_streak_stop: int = 8,
         stages: list | None = None,
     ) -> None:
         super().__init__()
         self._window_size = max(2, window_size)
         self._threshold = similarity_threshold
+        self._fuzzy_warn = max(2, fuzzy_streak_warn)
+        self._fuzzy_stop = max(self._fuzzy_warn + 1, fuzzy_streak_stop)
         self._stages = sorted(
             stages or [],
             key=lambda s: s.after,
@@ -80,7 +87,10 @@ class DoomLoopGate(LoopGate):
         if state is None:
             state = _DoomState(
                 history=deque(
-                    maxlen=self._window_size * 2,
+                    maxlen=max(
+                        self._window_size * 2,
+                        self._fuzzy_stop + 1,
+                    ),
                 ),
             )
             self.activate(state)
@@ -90,6 +100,7 @@ class DoomLoopGate(LoopGate):
         self,
         tool_name: str,
         args_hash: str,
+        fingerprint: str = "",
     ) -> None:
         """Record a completed tool call."""
         state = self._ensure_state()
@@ -97,6 +108,7 @@ class DoomLoopGate(LoopGate):
             _ToolCallRecord(
                 tool_name=tool_name,
                 args_hash=args_hash,
+                fingerprint=fingerprint,
             ),
         )
 
@@ -127,6 +139,34 @@ class DoomLoopGate(LoopGate):
         is_looping = self._detect_repetition(state)
 
         if not is_looping:
+            streak = self._fuzzy_streak(state)
+            if streak >= self._fuzzy_stop:
+                logger.info(
+                    "DoomLoopGate: STOP after fuzzy streak of %d",
+                    streak,
+                )
+                return StopHandlerResult(
+                    action=StopAction.TERMINATE,
+                    reason=(
+                        "Doom loop: agent stuck after "
+                        f"{streak} consecutive similar calls"
+                    ),
+                )
+            if streak >= self._fuzzy_warn:
+                state.prompt = (
+                    "[WARNING] Repetitive pattern detected. You are calling "
+                    f"{self._streak_tool(state)} with similar arguments "
+                    f"{streak} times without progress. Try a completely "
+                    "different approach."
+                )
+                logger.warning(
+                    "DoomLoopGate: warning at fuzzy streak of %d",
+                    streak,
+                )
+                return StopHandlerResult(
+                    action=StopAction.INTERRUPT_AND_CONTINUE,
+                    reason="doom_loop repetition warning",
+                )
             state.consecutive_hits = 0
             state.prompt = ""
             return _bypass
@@ -215,10 +255,12 @@ class DoomLoopGate(LoopGate):
                     else getattr(block, "input", "")
                 )
                 args_hash = self._hash_args(raw_input)
+                fingerprint = self._fingerprint_args(raw_input)
                 state.history.append(
                     _ToolCallRecord(
                         tool_name=name,
                         args_hash=args_hash,
+                        fingerprint=fingerprint,
                     ),
                 )
                 return
@@ -242,6 +284,43 @@ class DoomLoopGate(LoopGate):
             ).encode()[:_MAX_HASH_INPUT]
         return hashlib.md5(data).hexdigest()[:8]
 
+    @staticmethod
+    def _mask_numbers(value: Any) -> Any:
+        """Replace numeric values with a placeholder, recursively.
+
+        Only true numbers and digit-only strings are masked; digits inside
+        file names or free text are kept so that e.g. ``slide_1.png`` and
+        ``slide_2.png`` stay distinct.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return "#"
+        if isinstance(value, str):
+            return "#" if value.isdigit() else value
+        if isinstance(value, dict):
+            return {
+                key: DoomLoopGate._mask_numbers(val)
+                for key, val in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [DoomLoopGate._mask_numbers(val) for val in value]
+        return value
+
+    @classmethod
+    def _fingerprint_args(cls, raw_input: Any) -> str:
+        """Canonical args text with numbers masked, for streak detection."""
+        if isinstance(raw_input, str):
+            try:
+                raw_input = json.loads(raw_input)
+            except (TypeError, ValueError):
+                return raw_input[:_ARGS_TEXT_LIMIT]
+        return json.dumps(
+            cls._mask_numbers(raw_input),
+            sort_keys=True,
+            default=str,
+        )[:_ARGS_TEXT_LIMIT]
+
     def _detect_repetition(
         self,
         state: _DoomState,
@@ -261,6 +340,36 @@ class DoomLoopGate(LoopGate):
             )
             return True
         return False
+
+    @staticmethod
+    def _fingerprint(record: _ToolCallRecord) -> str:
+        """Stable signature of a call: tool plus masked args.
+
+        Calls that differ only in numeric argument values (offsets, line
+        ranges, limits) share a fingerprint. A long run of same-fingerprint
+        calls is the natural shape of a loop where a model retries one tool
+        with varying numbers — while legitimate work usually interleaves
+        other tools or touches different files.
+        """
+        return f"{record.tool_name}:{record.fingerprint}"
+
+    def _fuzzy_streak(self, state: _DoomState) -> int:
+        """Length of the trailing run of same-fingerprint calls."""
+        history = list(state.history)
+        if not history:
+            return 0
+        fingerprint = self._fingerprint(history[-1])
+        streak = 0
+        for record in reversed(history):
+            if self._fingerprint(record) != fingerprint:
+                break
+            streak += 1
+        return streak
+
+    def _streak_tool(self, state: _DoomState) -> str:
+        """Tool name of the current fuzzy streak (for warning text)."""
+        history = list(state.history)
+        return history[-1].tool_name if history else "the same tool"
 
     @staticmethod
     def _compute_similarity(
