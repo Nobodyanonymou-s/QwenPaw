@@ -22,6 +22,8 @@ from typing import (
     Optional,
 )
 
+from .sse_coalescer import SSECoalescer
+
 logger = logging.getLogger(__name__)
 
 _SENTINEL = None
@@ -284,6 +286,7 @@ class TaskTracker:
 
             async def _producer() -> None:
                 start_time = datetime.now(timezone.utc)
+                coalescer = SSECoalescer()
 
                 try:
                     tracker = tracker_ref()
@@ -298,9 +301,23 @@ class TaskTracker:
                         if tracker is None:
                             return
                         async with tracker.lock:
-                            run.buffer.append(sse)
+                            # Adjacent delta events for the same block are
+                            # merged before buffering/broadcast: subscribers
+                            # and the replay buffer see the concatenated
+                            # delta instead of thousands of tiny ones, which
+                            # the console frontend appends identically.
+                            for out in coalescer.push(sse):
+                                run.buffer.append(out)
+                                for q in run.queues:
+                                    q.put_nowait(out)
+                    for out in coalescer.flush():
+                        tracker = tracker_ref()
+                        if tracker is None:
+                            return
+                        async with tracker.lock:
+                            run.buffer.append(out)
                             for q in run.queues:
-                                q.put_nowait(sse)
+                                q.put_nowait(out)
                 except asyncio.CancelledError:
                     logger.debug("run cancelled run_key=%s", run_key)
                 except Exception:
