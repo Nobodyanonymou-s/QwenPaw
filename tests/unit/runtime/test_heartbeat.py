@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 
 import pytest
@@ -103,3 +104,28 @@ async def test_closing_wrapper_cancels_pending_source() -> None:
     await asyncio.sleep(0)
 
     assert source_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_non_positive_interval_is_clamped_not_busy_polled():
+    """interval=0 must not degenerate asyncio.wait into a busy poll."""
+    import time
+
+    async def stalled_source():
+        while True:
+            await asyncio.sleep(3600)
+            yield None
+
+    ticks = 0
+    deadline = time.monotonic() + 0.3
+    gen = _iter_with_heartbeat(stalled_source(), 0)
+    async with contextlib.aclosing(gen):
+        async for ev in gen:
+            assert ev is _HEARTBEAT_TICK
+            ticks += 1
+            if time.monotonic() > deadline:
+                break
+
+    # clamped to >= 1s: a 0.3s window must see at most one tick instead
+    # of tens of thousands
+    assert ticks <= 1

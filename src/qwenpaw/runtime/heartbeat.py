@@ -14,7 +14,12 @@ async def _iter_with_heartbeat(source_iter, interval: float):
     Keep one ``__anext__()`` task alive across heartbeat timeouts. Using
     ``asyncio.wait`` distinguishes an idle wait from ``TimeoutError`` raised
     by the source iterator, so source exceptions propagate unchanged.
+
+    A non-positive interval is clamped to one second: ``asyncio.wait`` with
+    ``timeout=0`` degenerates into a busy poll that synthesizes heartbeats
+    as fast as the CPU allows (measured ~29k/s against a stalled source).
     """
+    interval = max(float(interval), 1.0)
     pending = None
     try:
         while True:
