@@ -17,11 +17,16 @@ ordering and non-delta semantics are preserved exactly.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 # Emit a merged event once it reaches this size so one merge cannot grow
 # without bound either.
 DEFAULT_MAX_BYTES = 8192
+
+# Emit a pending merge once it is this old, so an actively streaming reply
+# still renders incrementally instead of arriving as one block.
+DEFAULT_WINDOW_SECONDS = 0.1
 
 
 def _frame(payload: str) -> str:
@@ -86,13 +91,16 @@ class SSECoalescer:
         self,
         max_bytes: int = DEFAULT_MAX_BYTES,
         *,
+        window_s: float = DEFAULT_WINDOW_SECONDS,
         drop_heartbeats: bool = False,
     ) -> None:
         self._max_bytes = max_bytes
+        self._window = window_s
         self._drop_heartbeats = drop_heartbeats
         self._key: tuple | None = None
         self._evt: dict[str, Any] | None = None
         self._size = 0
+        self._started = 0.0
 
     def push(self, sse: str) -> list[str]:
         """Feed one SSE frame; return the frames that may be emitted now."""
@@ -110,7 +118,10 @@ class SSECoalescer:
             return self.flush() + [sse]
 
         out: list[str] = []
-        if self._evt is not None and _merge_key(evt) != self._key:
+        if self._evt is not None and (
+            _merge_key(evt) != self._key
+            or time.monotonic() - self._started >= self._window
+        ):
             out = self.flush()
 
         field, value = merge
@@ -118,6 +129,7 @@ class SSECoalescer:
             self._key = _merge_key(evt)
             self._evt = evt
             self._size = len(sse)
+            self._started = time.monotonic()
             return out
 
         if field == "arguments":
@@ -138,4 +150,5 @@ class SSECoalescer:
         self._evt = None
         self._key = None
         self._size = 0
+        self._started = 0.0
         return [_frame(payload)]

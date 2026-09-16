@@ -199,3 +199,20 @@ async def test_producer_buffers_coalesced_events():
         if '"delta": true' in f
     )
     assert merged == "".join(parts)
+
+
+def test_window_flush_keeps_streaming_incremental():
+    """A pending merge older than the window is emitted, not extended."""
+    import time as _time
+
+    co = SSECoalescer(window_s=0.05)
+    out: list[str] = []
+    for i in range(3):
+        out.extend(co.push(_sse(_text("m1", f"part{i};"))))
+        _time.sleep(0.08)  # beyond the window each time
+    out.extend(co.flush())
+
+    payloads = [json.loads(f[5:].strip()) for f in out]
+    # three slow feeds -> three separate events, content preserved
+    assert len(payloads) == 3
+    assert "".join(e["text"] for e in payloads) == "part0;part1;part2;"
