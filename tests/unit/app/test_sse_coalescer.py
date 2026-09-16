@@ -133,7 +133,7 @@ def test_non_delta_snapshots_are_barriers():
         "data": {"output": "full result"},
     }
     out = _run(
-        [_sse(_text("m1", "a")), _sse(snapshot), _sse(_text("m1", "b"))]
+        [_sse(_text("m1", "a")), _sse(snapshot), _sse(_text("m1", "b"))],
     )
 
     assert len(out) == 3
