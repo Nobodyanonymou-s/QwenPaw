@@ -46,6 +46,13 @@ import i18n from "../../i18n";
 import { useLocation, useNavigate } from "react-router-dom";
 import sessionApi from "./sessionApi";
 import {
+  createStreamTracker,
+  createStreamWatchdog,
+  createTurnRunningState,
+  HANDLE_RECONNECT_EVENT,
+  POLL_INTERVAL_MS,
+} from "./streamWatchdog";
+import {
   getDraftStorageKey,
   parseDraft,
   serializeDraft,
@@ -2351,6 +2358,47 @@ export default function ChatPage() {
   const staleAutoSelectedIdRef = useRef<string | null>(null);
   const chatIdRef = useRef(chatId);
   const navigateRef = useRef(navigate);
+  // Stream-death watchdog state: counts live chat streams and remembers
+  // whether the UI believes a turn is running (send starts it, a terminal
+  // response event or cancel clears it).
+  const streamTrackerRef = useRef(createStreamTracker());
+  const turnRunningRef = useRef(createTurnRunningState());
+  const streamWatchdogRef = useRef(
+    createStreamWatchdog({
+      isRunningTurn: () => turnRunningRef.current.get(),
+      activeStreamCount: () => streamTrackerRef.current.activeCount(),
+      lastSendAt: () => turnRunningRef.current.lastSendAt(),
+      isSessionGenerating: async () => {
+        const identity = sessionApi.getSessionIdentity(chatIdRef.current);
+        if (!identity.sessionId) return false;
+        try {
+          const session = await sessionApi.getSession(identity.sessionId);
+          return !!session?.generating;
+        } catch {
+          // Probe failed — assume still generating so the recovery
+          // attempt is a reconnect rather than a finalize.
+          return true;
+        }
+      },
+      requestReconnect: () => {
+        const identity = sessionApi.getSessionIdentity(chatIdRef.current);
+        if (!identity.sessionId) return;
+        // Same DOM event the SDK's session-mount path dispatches; the
+        // configured reconnect callback re-checks its own guards.
+        document.dispatchEvent(
+          new CustomEvent(HANDLE_RECONNECT_EVENT, {
+            detail: { session_id: identity.sessionId },
+          }),
+        );
+      },
+    }),
+  );
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void streamWatchdogRef.current.tick();
+    }, POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const handler = () => {
@@ -3206,6 +3254,8 @@ export default function ChatPage() {
           "Chat submission has no input; wait for session history to load",
         );
       }
+      turnRunningRef.current.markSend();
+      streamWatchdogRef.current.reset();
       pendingFallbackEventsRef.current = [];
       pendingFallbackEventKeysRef.current.clear();
       // Snapshot legacy state before the first await. SDK 1.2 supplies the
@@ -3462,7 +3512,11 @@ export default function ChatPage() {
         sessionApi.triggerResolve(localIdToResolve);
       }
 
-      return wrapChatResponseUsageStream(response, chatRef, usageTurn);
+      return wrapChatResponseUsageStream(
+        streamTrackerRef.current.trackResponse(response),
+        chatRef,
+        usageTurn,
+      );
     },
     [extLists, selectedAgent, runningConfigApprovalLevel, usesQwenPawBackend],
   );
@@ -4244,6 +4298,18 @@ export default function ChatPage() {
               }
             }
           }
+          // A terminal response status ends the turn for the stream
+          // watchdog: clear the running flag so a completed/failed turn
+          // is not mistaken for a dead stream once the quiet window
+          // elapses. ("cancelled" was normalized to "canceled" above.)
+          if (
+            payload.object === "response" &&
+            ["completed", "failed", "canceled"].includes(
+              payload.status as string,
+            )
+          ) {
+            turnRunningRef.current.clear();
+          }
           markLoopModeRunning();
           sanitizeHeadlinePayload(payload, headlineStreamFilterRef.current);
 
@@ -4354,6 +4420,9 @@ export default function ChatPage() {
           // alive to observe the abort; record the stop itself so tool cards
           // can close even when the stream died first.
           markTurnStopped(data.session_id || data.chatSessionId);
+          // A user stop is not a dead stream: drop the watchdog's
+          // running-turn belief so it does not try to "recover" this turn.
+          turnRunningRef.current.clear();
           const snapshot = resolveChatRequestSnapshot(
             data,
             {},
@@ -4416,7 +4485,9 @@ export default function ChatPage() {
           // Fast-forward the replayed section: render the already
           // generated part instantly instead of re-animating it.
           return wrapChatResponseUsageStream(
-            wrapReplayFastForward(response),
+            streamTrackerRef.current.trackResponse(
+              wrapReplayFastForward(response),
+            ),
             chatRef,
             usageTurn,
           );
