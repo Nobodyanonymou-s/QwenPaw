@@ -1435,6 +1435,155 @@ async def undo_agent_memory_reindex(
     return EmbeddingModelConfig.model_validate(response.answer)
 
 
+class MemoryMaintenanceRequest(BaseModel):
+    """Optional inputs for one explicit auto-memory / auto-dream pass."""
+
+    messages: list[dict[str, Any]] | None = None
+    session_id: str = ""
+    memory_hint: str | None = None
+    date: str = ""
+
+
+async def _run_memory_action(
+    agentId: str,
+    request: Request,
+    action: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Await one registered memory action with the reindex checks.
+
+    Raises the same availability errors as the reindex endpoint: unknown
+    agent (404), non-ReMe-Light backend (400), no manager (503), backend
+    without actions (501), failed job (500).
+    """
+    config = await run_sync_io(load_config)
+    if agentId not in config.agents.profiles:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agentId}' not found",
+        )
+
+    agent_config = await run_sync_io(load_agent_config, agentId)
+    if agent_config.running.memory_manager_backend != "remelight":
+        raise HTTPException(
+            status_code=400,
+            detail="Memory actions are only supported by ReMe Light",
+        )
+
+    manager = _get_multi_agent_manager(request)
+    workspace = await manager.get_agent(agentId)
+    memory_manager = workspace.memory_manager
+    if memory_manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory manager is not available",
+        )
+    if not isinstance(memory_manager, MemoryActionProvider):
+        raise HTTPException(
+            status_code=501,
+            detail="Memory backend does not support actions",
+        )
+
+    response = await memory_manager.run_action(action, **kwargs)
+    if response is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ReMe is not started or the '{action}' job failed",
+        )
+    if not response.success:
+        raise HTTPException(status_code=500, detail=str(response.answer))
+    return {"status": "completed", "answer": response.answer}
+
+
+@router.post(
+    "/{agentId}/memory/auto-memory",
+    summary="Run one auto-memory pass synchronously",
+    description=(
+        "Record the supplied conversation messages into the agent's "
+        "daily note and return once the notes are persisted. Use this "
+        "instead of the interval trigger when a maintenance window must "
+        "observe completion."
+    ),
+)
+async def run_agent_auto_memory(
+    agentId: str = PathParam(...),
+    payload: MemoryMaintenanceRequest = None,
+    request: Request = None,
+) -> dict[str, Any]:
+    """Await the registered ``auto_memory`` action for this agent."""
+    if not payload or not payload.messages:
+        raise HTTPException(
+            status_code=400,
+            detail="'messages' (non-empty list) is required",
+        )
+    return await _run_memory_action(
+        agentId,
+        request,
+        "auto_memory",
+        messages=payload.messages,
+        session_id=payload.session_id,
+        memory_hint=payload.memory_hint,
+    )
+
+
+@router.post(
+    "/{agentId}/memory/dream",
+    summary="Run one auto-dream pass synchronously",
+    description=(
+        "Scan the agent's recent daily notes and persist the dream "
+        "catalog, returning when the pass completes."
+    ),
+)
+async def run_agent_dream(
+    agentId: str = PathParam(...),
+    payload: MemoryMaintenanceRequest = None,
+    request: Request = None,
+) -> dict[str, Any]:
+    """Await the registered ``auto_dream`` action for this agent."""
+    return await _run_memory_action(
+        agentId,
+        request,
+        "auto_dream",
+        date=payload.date if payload else "",
+    )
+
+
+@router.post(
+    "/{agentId}/memory/maintenance",
+    summary="Flush notes and dream in one maintenance pass",
+    description=(
+        "Run auto-memory (when messages are supplied) followed by "
+        "auto-dream, synchronously. A 200 response means the messages "
+        "are persisted as daily notes AND the dream pass completed; on "
+        "failure the sequence stops and the error names the step that "
+        "failed, so the already-completed part is known."
+    ),
+)
+async def run_agent_memory_maintenance(
+    agentId: str = PathParam(...),
+    payload: MemoryMaintenanceRequest = None,
+    request: Request = None,
+) -> dict[str, Any]:
+    """Serially await auto_memory -> auto_dream for a shutdown window."""
+    results: dict[str, Any] = {}
+    if payload and payload.messages:
+        results["auto_memory"] = await _run_memory_action(
+            agentId,
+            request,
+            "auto_memory",
+            messages=payload.messages,
+            session_id=payload.session_id,
+            memory_hint=payload.memory_hint,
+        )
+    results["auto_dream"] = await _run_memory_action(
+        agentId,
+        request,
+        "auto_dream",
+        date=payload.date if payload else "",
+    )
+    return results
+
+
 @router.get(
     "/{agentId}/memory/runtime-status",
     response_model=MemoryRuntimeStatus,

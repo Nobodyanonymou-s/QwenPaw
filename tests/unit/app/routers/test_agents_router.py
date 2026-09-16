@@ -2047,3 +2047,210 @@ def test_copy_agent_optional_assets_match_request_flags(
         assert not (new_ws / "jobs.json").exists()
 
     manager_mock.schedule_agent_startup.assert_called_once_with(agent_id)
+
+
+# ---------------------------------------------------------------------------
+# POST /agents/{id}/memory/auto-memory | dream | maintenance
+# ---------------------------------------------------------------------------
+
+
+def test_auto_memory_awaits_action_with_messages(
+    client,
+    fake_config,
+    manager_mock,
+):
+    agent_config = AgentProfileConfig(id="bot", name="Bot")
+    memory_manager = MagicMock(spec=MemoryActionProvider)
+    memory_manager.run_action = AsyncMock(
+        return_value=MagicMock(success=True, answer="noted"),
+    )
+    manager_mock.get_agent = AsyncMock(
+        return_value=MagicMock(memory_manager=memory_manager),
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=agent_config,
+        ),
+    ):
+        response = client.post(
+            "/api/agents/bot/memory/auto-memory",
+            json={"messages": messages, "session_id": "s1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "completed", "answer": "noted"}
+    memory_manager.run_action.assert_awaited_once_with(
+        "auto_memory",
+        messages=messages,
+        session_id="s1",
+        memory_hint=None,
+    )
+
+
+def test_auto_memory_requires_messages(client, fake_config, manager_mock):
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch("qwenpaw.app.routers.agents.load_agent_config"),
+    ):
+        response = client.post("/api/agents/bot/memory/auto-memory", json={})
+
+    assert response.status_code == 400
+
+
+def test_dream_awaits_action_with_optional_date(
+    client,
+    fake_config,
+    manager_mock,
+):
+    agent_config = AgentProfileConfig(id="bot", name="Bot")
+    memory_manager = MagicMock(spec=MemoryActionProvider)
+    memory_manager.run_action = AsyncMock(
+        return_value=MagicMock(success=True, answer="dreamed"),
+    )
+    manager_mock.get_agent = AsyncMock(
+        return_value=MagicMock(memory_manager=memory_manager),
+    )
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=agent_config,
+        ),
+    ):
+        response = client.post(
+            "/api/agents/bot/memory/dream",
+            json={"date": "2026-09-15"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "completed", "answer": "dreamed"}
+    memory_manager.run_action.assert_awaited_once_with(
+        "auto_dream",
+        date="2026-09-15",
+    )
+
+
+def test_maintenance_runs_memory_then_dream(client, fake_config, manager_mock):
+    agent_config = AgentProfileConfig(id="bot", name="Bot")
+    memory_manager = MagicMock(spec=MemoryActionProvider)
+    memory_manager.run_action = AsyncMock(
+        side_effect=[
+            MagicMock(success=True, answer="notes saved"),
+            MagicMock(success=True, answer="dream done"),
+        ],
+    )
+    manager_mock.get_agent = AsyncMock(
+        return_value=MagicMock(memory_manager=memory_manager),
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=agent_config,
+        ),
+    ):
+        response = client.post(
+            "/api/agents/bot/memory/maintenance",
+            json={"messages": messages, "session_id": "s1"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auto_memory"]["answer"] == "notes saved"
+    assert body["auto_dream"]["answer"] == "dream done"
+    assert memory_manager.run_action.await_count == 2
+    memory_manager.run_action.assert_any_await(
+        "auto_memory",
+        messages=messages,
+        session_id="s1",
+        memory_hint=None,
+    )
+    memory_manager.run_action.assert_any_await("auto_dream", date="")
+
+
+def test_maintenance_without_messages_runs_dream_only(
+    client,
+    fake_config,
+    manager_mock,
+):
+    agent_config = AgentProfileConfig(id="bot", name="Bot")
+    memory_manager = MagicMock(spec=MemoryActionProvider)
+    memory_manager.run_action = AsyncMock(
+        return_value=MagicMock(success=True, answer="dream done"),
+    )
+    manager_mock.get_agent = AsyncMock(
+        return_value=MagicMock(memory_manager=memory_manager),
+    )
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=agent_config,
+        ),
+    ):
+        response = client.post("/api/agents/bot/memory/maintenance", json={})
+
+    assert response.status_code == 200
+    assert "auto_memory" not in response.json()
+    memory_manager.run_action.assert_awaited_once_with("auto_dream", date="")
+
+
+def test_maintenance_failure_stops_after_completed_step(
+    client,
+    fake_config,
+    manager_mock,
+):
+    agent_config = AgentProfileConfig(id="bot", name="Bot")
+    memory_manager = MagicMock(spec=MemoryActionProvider)
+    memory_manager.run_action = AsyncMock(
+        side_effect=[
+            MagicMock(success=True, answer="notes saved"),
+            MagicMock(success=False, answer="dream exploded"),
+        ],
+    )
+    manager_mock.get_agent = AsyncMock(
+        return_value=MagicMock(memory_manager=memory_manager),
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=fake_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=agent_config,
+        ),
+    ):
+        response = client.post(
+            "/api/agents/bot/memory/maintenance",
+            json={"messages": messages},
+        )
+
+    assert response.status_code == 500
+    assert "dream exploded" in response.json()["detail"]
+    assert memory_manager.run_action.await_count == 2
