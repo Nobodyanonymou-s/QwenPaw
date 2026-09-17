@@ -9,6 +9,9 @@ import pytest
 from agentscope.agent import Agent
 from google.genai import errors as genai_errors
 
+from qwenpaw.agents.context.overflow_recovery import (
+    parse_reported_context_limit,
+)
 from qwenpaw.agents.react_agent import QwenPawAgent
 
 
@@ -273,3 +276,159 @@ def test_context_overflow_classifier_supports_aiohttp_response_status():
     exc = Exception("context length exceeded")
     exc.response = SimpleNamespace(status=400)
     assert QwenPawAgent._is_context_overflow_error(exc) is True
+
+
+# ----- provider-reported context limit persistence -----
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "Error code: 400 - This model's maximum context length is "
+            "8192 tokens.",
+            8192,
+        ),
+        ("Error code: 400 - context length is 4096 tokens", 4096),
+        (
+            "The input token count (1337419) exceeds the maximum number "
+            "of tokens allowed (1048576).",
+            1048576,
+        ),
+        ("Error code: 400 - context length exceeded", None),
+    ],
+)
+def test_parse_reported_context_limit_variants(message, expected):
+    assert parse_reported_context_limit(Exception(message)) == expected
+
+
+def _agent_with_model_slot(context_manager, order):
+    agent = _agent(context_manager=context_manager)
+    agent._agent_config = SimpleNamespace(
+        active_model=SimpleNamespace(
+            provider_id="prov-a",
+            model="model-b",
+        ),
+    )
+    agent._order = order
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_reported_context_limit_persisted_before_compaction(
+    monkeypatch,
+):
+    order = []
+    update_model_config = AsyncMock(return_value=SimpleNamespace())
+
+    class _FakeProviderManager:
+        @staticmethod
+        def get_instance():
+            return SimpleNamespace(update_model_config=update_model_config)
+
+    monkeypatch.setattr(
+        "qwenpaw.providers.provider_manager.ProviderManager",
+        _FakeProviderManager,
+    )
+
+    async def fake_call_model(self, messages, tools, tool_choice=None):
+        raise _ContextOverflowError(
+            "This model's maximum context length is 8192 tokens.",
+        )
+
+    monkeypatch.setattr(Agent, "_call_model", fake_call_model)
+
+    class _OrderedScroll(_ScrollManager):
+        async def recover_from_context_overflow(self, agent):
+            order.append("compact")
+            return await super().recover_from_context_overflow(agent)
+
+    agent = _agent_with_model_slot(_OrderedScroll(["compacted"]), order)
+    update_model_config.side_effect = lambda **kw: order.append("persist")
+
+    async def run():
+        try:
+            await agent._call_model(
+                messages=["system", "old-1"],
+                tools=[{"name": "old-tool"}],
+                tool_choice="auto",
+            )
+        except _ContextOverflowError:
+            # The retry through the fake raises the same class; only the
+            # ordering of persist-vs-compact matters here.
+            pass
+
+    await run()
+
+    assert order == ["persist", "compact"]
+    update_model_config.assert_awaited_once_with(
+        provider_id="prov-a",
+        model_id="model-b",
+        config={"max_input_length": 8192},
+    )
+
+
+@pytest.mark.asyncio
+async def test_reported_context_limit_absent_skips_persist(monkeypatch):
+    update_model_config = AsyncMock()
+
+    class _FakeProviderManager:
+        @staticmethod
+        def get_instance():
+            return SimpleNamespace(update_model_config=update_model_config)
+
+    monkeypatch.setattr(
+        "qwenpaw.providers.provider_manager.ProviderManager",
+        _FakeProviderManager,
+    )
+
+    async def fake_call_model(self, messages, tools, tool_choice=None):
+        raise _ContextOverflowError(
+            "Error code: 400 - context length exceeded",
+        )
+
+    monkeypatch.setattr(Agent, "_call_model", fake_call_model)
+
+    agent = _agent_with_model_slot(_ScrollManager(["compacted"]), [])
+    with pytest.raises(_ContextOverflowError):
+        await agent._call_model(
+            messages=["system", "old-1"],
+            tools=[{"name": "old-tool"}],
+            tool_choice="auto",
+        )
+
+    update_model_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_does_not_break_recovery(monkeypatch):
+    class _ExplodingProviderManager:
+        @staticmethod
+        def get_instance():
+            raise RuntimeError("provider store unavailable")
+
+    monkeypatch.setattr(
+        "qwenpaw.providers.provider_manager.ProviderManager",
+        _ExplodingProviderManager,
+    )
+
+    calls = []
+
+    async def fake_call_model(self, messages, tools, tool_choice=None):
+        calls.append(messages)
+        if len(calls) == 1:
+            raise _ContextOverflowError(
+                "This model's maximum context length is 8192 tokens.",
+            )
+        return "ok"
+
+    monkeypatch.setattr(Agent, "_call_model", fake_call_model)
+
+    agent = _agent_with_model_slot(_ScrollManager(["compacted"]), [])
+    result = await agent._call_model(
+        messages=["system", "old-1"],
+        tools=[{"name": "old-tool"}],
+        tool_choice="auto",
+    )
+
+    assert result == "ok"
+    assert len(calls) == 2

@@ -31,7 +31,10 @@ from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from .context.base import ContextManager
-from .context.overflow_recovery import call_with_overflow_recovery
+from .context.overflow_recovery import (
+    call_with_overflow_recovery,
+    persist_reported_context_limit,
+)
 from .skill_system import get_workspace_skills_dir
 from .utils.image_freezing import freeze_local_images_async
 from .utils.message_request_normalizer import _is_media_block
@@ -720,6 +723,20 @@ class QwenPawAgent(CodingModeMixin, Agent):
         logger.warning(
             "Model input exceeded the provider context limit; attempting "
             "one context recovery.",
+        )
+        # Correct the stored window first when the rejection states the real
+        # limit: compaction re-resolves it on its hot path, so this recovery
+        # (and every later turn) compacts against the provider's limit
+        # instead of a stale, larger belief.
+        model_slot = getattr(
+            getattr(self, "_agent_config", None),
+            "active_model",
+            None,
+        )
+        await persist_reported_context_limit(
+            exc,
+            provider_id=getattr(model_slot, "provider_id", "") or "",
+            model_id=getattr(model_slot, "model", "") or "",
         )
         input_changed = await context_manager.recover_from_context_overflow(
             self,
