@@ -2400,6 +2400,17 @@ export default function ChatPage() {
     return () => window.clearInterval(timer);
   }, []);
 
+  // Switching chats invalidates the running-turn belief: the flag belongs
+  // to the previous chat's stream, while the watchdog probes by the
+  // current chatId — a stale flag would mis-fire finalize reconnects at
+  // the newly opened (idle) session.
+  const prevChatIdRef = useRef(chatId);
+  useEffect(() => {
+    if (prevChatIdRef.current === chatId) return;
+    prevChatIdRef.current = chatId;
+    turnRunningRef.current.clear();
+  }, [chatId]);
+
   useEffect(() => {
     const handler = () => {
       void fetchMultimodalCaps();
@@ -4389,6 +4400,19 @@ export default function ChatPage() {
               (payload.alternatives as typeof rateLimitAlternatives) || [];
             setRateLimitAlternatives(alts);
             message.warning(t("chat.rateLimitHit"));
+            return null;
+          }
+
+          // Terminal failure signalled by the console channel (provider
+          // down, turn crashed): render it and end the running-turn
+          // belief here rather than waiting out the watchdog's quiet
+          // window. Complements the failed-status response event, which
+          // covers the paths that do emit one.
+          if (payload.type === "error") {
+            const detail =
+              typeof payload.error === "string" ? payload.error.trim() : "";
+            turnRunningRef.current.clear();
+            message.error(detail || t("chat.queue.sendFailed"));
             return null;
           }
 
