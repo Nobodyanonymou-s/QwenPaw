@@ -1288,10 +1288,15 @@ def load_governance_policy(
 
     version = data.get("version", "1.0")
     audit_level = data.get("audit_level", "all")
-    # save_governance_policy always writes the v2.0 format; a file still
-    # on v1.0 is normalized on the next persist.
+    # One-time version migration. save_governance_policy serializes the
+    # policy's own version marker into an otherwise v2.0-layout body, so a
+    # legacy "1.0" marker must be normalized here — otherwise every load
+    # flags the file as changed and the governor keeps rewriting it on
+    # every start. Nothing else consumes ``version``; the flagged persist
+    # writes "2.0" and the next load is a no-op.
     if str(version) != "2.0":
         changed = True
+        version = "2.0"
 
     # ── builtin_rules: ALWAYS sourced from code (not from YAML) ──
     # Rationale: builtin_rules encode system-level protections (e.g. ASK on

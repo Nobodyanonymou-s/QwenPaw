@@ -21,9 +21,10 @@ from .utils.file_handling import read_text_file_with_encoding_fallback
 
 logger = logging.getLogger(__name__)
 
-# Single-slot TTL cache for the multimodal capability hint (see
-# build_multimodal_hint).
-_MULTIMODAL_HINT_CACHE: dict = {}
+# Per-agent TTL cache for the multimodal capability hint (see
+# build_multimodal_hint). Keyed by agent id because agents may pin
+# different active models; unresolved results are never cached.
+_MULTIMODAL_HINT_CACHE: dict[str, tuple[float, str]] = {}
 _MULTIMODAL_HINT_TTL = 60.0
 
 # Default fallback prompt
@@ -529,19 +530,24 @@ def build_multimodal_hint() -> str:
     """Build a short system-prompt snippet describing multimodal capability."""
     # The hint is a pure function of the active model's capability
     # metadata, but resolving that re-reads the agent config and provider
-    # catalog on every request. Cache the rendered hint briefly; it is
-    # advisory text, so bounded staleness after a model switch is
-    # harmless.
+    # catalog on every request. Cache the rendered hint per agent: agents
+    # may pin different active models, so a single slot would hand one
+    # agent another agent's hint. It is advisory text, so bounded
+    # staleness after a model switch is harmless.
+    from ..app.agent_context import get_current_agent_id
+
     now = time.monotonic()
-    cached = _MULTIMODAL_HINT_CACHE.get("hint")
+    agent_id = get_current_agent_id()
+    cached = _MULTIMODAL_HINT_CACHE.get(agent_id)
     if cached is not None and now - cached[0] < _MULTIMODAL_HINT_TTL:
         return cached[1]
     model_info, model_name = _get_active_model_info()
     if model_info is None:
-        hint = ""
-    else:
-        hint = format_multimodal_hint(model_info, model_name)
-    _MULTIMODAL_HINT_CACHE["hint"] = (now, hint)
+        # Unresolved: do not cache. A model that is not yet configured
+        # must not pin an empty hint for the whole TTL window.
+        return ""
+    hint = format_multimodal_hint(model_info, model_name)
+    _MULTIMODAL_HINT_CACHE[agent_id] = (now, hint)
     return hint
 
 
