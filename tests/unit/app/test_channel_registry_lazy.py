@@ -58,3 +58,20 @@ def test_registry_backcompat_still_returns_all():
 
     assert "console" in reg
     assert "feishu" in reg
+
+
+def test_available_keys_order_matches_registry():
+    """The cheap key list must preserve the registry's relative order.
+
+    ``get_available_keys`` lists every known key (importable or not), so
+    the registry's keys must equal the available keys filtered down to
+    the importable ones, in the same order — anything else would make
+    ``QWENPAW_ENABLED_CHANNELS`` processing order-dependent on which
+    loader a code path happened to use.
+    """
+    reg_keys = list(channel_registry.get_channel_registry().keys())
+    available = list(get_available_keys())
+
+    assert available  # sanity: the key list is not empty
+    assert set(reg_keys) <= set(available)
+    assert [k for k in available if k in reg_keys] == reg_keys

@@ -69,8 +69,10 @@ def _load_builtin_channels() -> dict[str, type[BaseChannel]]:
                     exc_info=True,
                 )
                 raise
-            logger.debug(
-                "built-in channel unavailable: %s",
+            logger.warning(
+                'built-in channel "%s" unavailable (import failed); '
+                "it will be skipped when enabled - install its SDK or "
+                "remove it from the enabled channel set",
                 key,
                 exc_info=True,
             )
@@ -180,8 +182,10 @@ def get_channel_class(
                     exc_info=True,
                 )
                 raise
-            logger.debug(
-                "built-in channel unavailable: %s",
+            logger.warning(
+                'built-in channel "%s" unavailable (import failed); '
+                "it will be skipped when enabled - install its SDK or "
+                "remove it from the enabled channel set",
                 key,
                 exc_info=True,
             )
@@ -196,7 +200,9 @@ def get_available_keys() -> tuple[str, ...]:
     """All channel keys without importing any channel module.
 
     Same ordering as :func:`get_channel_registry` (builtin declaration
-    order, then plugins).
+    order, then plugins): the registry's keys are exactly
+    ``get_available_keys()`` restricted to the channels that import
+    successfully, in the same relative order.
     """
     keys: list[str] = list(_BUILTIN_SPECS.keys())
     for key in _get_plugin_channels():
